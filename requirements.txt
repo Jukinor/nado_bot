@@ -1,0 +1,5 @@
+aiohttp==3.10.11
+websockets==13.1
+python-dotenv==1.0.1
+eth-account==0.13.4
+requests==2.32.3
