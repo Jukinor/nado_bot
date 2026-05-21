@@ -1,3 +1,9 @@
+"""
+real_fee_adapter.py — взаимодействие с Gateway и Archive API:
+  - get_available_balance_usd()   — баланс USDT0
+  - get_open_position(product_id) — реальная открытая позиция на бирже
+  - get_order_fee(digest)         — реальная комиссия по digest ордера
+"""
 import logging
 from decimal import Decimal
 from typing import Optional
@@ -6,87 +12,119 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+SCALE_X18 = Decimal("1000000000000000000")
+HEADERS = {"Accept-Encoding": "gzip, br, deflate", "Content-Type": "application/json"}
+
+
+def _build_subaccount_bytes32(address: str, subaccount_name: str) -> str:
+    """
+    Формирует bytes32 hex субаккаунта: address (20 bytes) + name (12 bytes, right-padded 0).
+    Пример: 0x<address_40chars><name_hex_padded_24chars>
+    """
+    addr_clean = address.lower().replace("0x", "")
+    name_hex = subaccount_name.encode("utf-8").hex()
+    name_padded = name_hex[:24].ljust(24, "0")
+    return "0x" + addr_clean + name_padded
+
 
 class RealFeeAdapter:
     def __init__(self, rest_base: str, account_address: str, subaccount_name: str) -> None:
-        self.rest_base = rest_base.rstrip('/')
+        self.rest_base = rest_base.rstrip("/")
         self.account_address = account_address
         self.subaccount_name = subaccount_name
+        self.subaccount_bytes32 = _build_subaccount_bytes32(account_address, subaccount_name)
+
+    async def _query(self, session: aiohttp.ClientSession, payload: dict) -> Optional[dict]:
+        url = f"{self.rest_base}/query"
+        try:
+            async with session.post(
+                url, json=payload, headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("status") != "success":
+                    logger.warning("gateway query failed payload=%s response=%s", payload, data)
+                    return None
+                return data.get("data")
+        except Exception as exc:
+            logger.warning("gateway query error payload=%s exc=%s", payload, exc)
+            return None
 
     async def get_available_balance_usd(self) -> Optional[Decimal]:
-        candidates = [
-            f"{self.rest_base}/subaccounts/{self.account_address}/{self.subaccount_name}",
-            f"{self.rest_base}/accounts/{self.account_address}/subaccounts/{self.subaccount_name}",
-            f"{self.rest_base}/accounts/{self.account_address}/balance",
-        ]
-        for url in candidates:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=10) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                value = self._extract_balance(data)
-                if value is not None:
-                    return value
-            except Exception:
-                logger.debug('Balance query failed for %s', url, exc_info=True)
-        return None
-
-    async def get_order_fee_usd(self, digest: str) -> Optional[Decimal]:
-        if not digest:
+        """Возвращает доступный баланс USDT0 (product_id=0) субаккаунта."""
+        async with aiohttp.ClientSession() as session:
+            data = await self._query(session, {
+                "type": "subaccount_info",
+                "subaccount": self.subaccount_bytes32,
+            })
+        if data is None:
             return None
-        candidates = [
-            f"{self.rest_base}/orders/{digest}",
-            f"{self.rest_base}/executions/{digest}",
-            f"{self.rest_base}/matches/{digest}",
-        ]
-        for url in candidates:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=10) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                value = self._extract_fee(data)
-                if value is not None:
-                    return value
-            except Exception:
-                logger.debug('Fee query failed for %s', url, exc_info=True)
+        for bal in data.get("spot_balances", []):
+            if bal.get("product_id") == 0:
+                raw = bal.get("balance", {}).get("amount", "0")
+                return Decimal(str(raw)) / SCALE_X18
+        return Decimal("0")
+
+    async def get_open_position(self, product_id: int) -> Optional[dict]:
+        """
+        Возвращает реальную perp-позицию по product_id или None если позиции нет.
+
+        Возвращаемый dict:
+          {
+            'side': 'long' | 'short',
+            'amount': Decimal,          # абсолютный размер
+            'v_quote_balance': Decimal, # virtual quote (отрицательный entry cost)
+            'entry_price': Decimal,     # приблизительная цена входа
+          }
+        """
+        async with aiohttp.ClientSession() as session:
+            data = await self._query(session, {
+                "type": "subaccount_info",
+                "subaccount": self.subaccount_bytes32,
+            })
+        if data is None:
+            return None
+
+        for bal in data.get("perp_balances", []):
+            if bal.get("product_id") == product_id:
+                amount_raw = Decimal(str(bal["balance"]["amount"]))
+                amount = amount_raw / SCALE_X18
+                if amount == 0:
+                    return None
+                v_quote = Decimal(str(bal["balance"]["v_quote_balance"])) / SCALE_X18
+                side = "long" if amount > 0 else "short"
+                abs_amount = abs(amount)
+                # entry_price ≈ |v_quote| / abs_amount
+                entry_price = abs(v_quote) / abs_amount if abs_amount > 0 else Decimal("0")
+                return {
+                    "side": side,
+                    "amount": abs_amount,
+                    "v_quote_balance": v_quote,
+                    "entry_price": entry_price,
+                }
         return None
 
-    def _extract_balance(self, payload) -> Optional[Decimal]:
-        if isinstance(payload, dict):
-            for key in ('available_balance_usd', 'availableUsd', 'available_balance', 'freeCollateral', 'collateral_value_usd', 'balance_usd', 'equity_usd'):
-                if key in payload and payload[key] not in (None, ''):
-                    return Decimal(str(payload[key]))
-            for value in payload.values():
-                found = self._extract_balance(value)
-                if found is not None:
-                    return found
-        elif isinstance(payload, list):
-            for item in payload:
-                found = self._extract_balance(item)
-                if found is not None:
-                    return found
-        return None
-
-    def _extract_fee(self, payload) -> Optional[Decimal]:
-        if isinstance(payload, dict):
-            for key in ('fee_usd', 'feeUsd', 'fee', 'trading_fee', 'execution_fee'):
-                if key in payload and payload[key] not in (None, ''):
-                    return Decimal(str(payload[key]))
-            for value in payload.values():
-                found = self._extract_fee(value)
-                if found is not None:
-                    return found
-        elif isinstance(payload, list):
-            total = Decimal('0')
-            found_any = False
-            for item in payload:
-                found = self._extract_fee(item)
-                if found is not None:
-                    total += found
-                    found_any = True
-            return total if found_any else None
-        return None
+    async def get_order_fee(
+        self, archive_base: str, order_digest: str
+    ) -> Optional[Decimal]:
+        """
+        Запрашивает реальную комиссию по digest ордера из Archive API.
+        Возвращает комиссию в USD (Decimal) или None.
+        """
+        url = archive_base
+        payload = {"orders": {"digests": [order_digest], "limit": 1}}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+            orders = data.get("orders") or []
+            if not orders:
+                return None
+            fee_raw = orders[0].get("fee", "0")
+            return Decimal(str(fee_raw)) / SCALE_X18
+        except Exception as exc:
+            logger.warning("get_order_fee error digest=%s exc=%s", order_digest, exc)
+            return None

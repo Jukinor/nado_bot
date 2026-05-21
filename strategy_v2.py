@@ -169,6 +169,9 @@ class TrendSignalStrategy:
         if direction == 'long':
             return base - move if kind == 'sl' else base + move
         return base + move if kind == 'sl' else base - move
+    def reset_position(self) -> None:
+        self.state = PositionState()
+        self.manual_close_requested = False
 
     def _trailing_distance_for(self, entry: Decimal) -> Optional[Decimal]:
         if self.trailing_distance is not None:

@@ -9,6 +9,11 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+HEADERS = {
+    "Accept-Encoding": "gzip, br, deflate",
+    "Content-Type": "application/json",
+}
+
 
 class NadoWsClient:
     def __init__(self, ws_base: str, rest_base: str, ping_interval_seconds: int = 20, open_timeout_seconds: int = 20) -> None:
@@ -68,6 +73,65 @@ class NadoWsClient:
                     continue
                 await callback(msg)
                 await asyncio.sleep(0)
+
+    async def place_order(self, product_id: int, order: Dict[str, Any], signature: str) -> Dict[str, Any]:
+        payload = {
+            'place_order': {
+                'product_id': int(product_id),
+                'order': order,
+                'signature': signature,
+            }
+        }
+        return await self._post_execute(payload, action='place_order')
+
+    async def cancel_orders(self, cancel_order_data: Dict[str, Any], signature: str) -> Dict[str, Any]:
+        payload = {
+            'cancel_orders': {
+                'tx': cancel_order_data,
+                'signature': signature,
+            }
+        }
+        return await self._post_execute(payload, action='cancel_orders')
+
+    async def _post_execute(self, payload: Dict[str, Any], action: str) -> Dict[str, Any]:
+        url = f'{self.rest_base}/execute'
+        logger.info('%s request payload=%s', action, payload)
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    raw_text = await resp.text()
+                    logger.info(
+                        '%s response status=%s content_type=%s body=%r',
+                        action,
+                        resp.status,
+                        resp.headers.get('Content-Type'),
+                        raw_text[:4000],
+                    )
+
+                    if not raw_text.strip():
+                        return {
+                            'status': 'empty_response',
+                            'http_status': resp.status,
+                            'body': '',
+                        }
+
+                    try:
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        return {
+                            'status': 'non_json_response',
+                            'http_status': resp.status,
+                            'body': raw_text[:4000],
+                        }
+
+                    return data if isinstance(data, dict) else {
+                        'status': 'unexpected_response_type',
+                        'http_status': resp.status,
+                        'raw': data,
+                    }
+            except Exception as exc:
+                logger.exception('%s request failed exc=%s', action, exc)
+                return {'status': 'request_error', 'error': str(exc)}
 
 
 def scale_x18(value: Any, scale: Decimal) -> Decimal | None:
