@@ -3,7 +3,42 @@ import time
 from typing import Any, Dict
 
 from eth_account import Account
-from eth_account.messages import encode_typed_data
+try:
+    from eth_account.messages import encode_typed_data as _encode_typed_data_new
+except ImportError:
+    _encode_typed_data_new = None
+
+try:
+    from eth_account.messages import encode_structured_data as _encode_structured_data_old
+except ImportError:
+    _encode_structured_data_old = None
+
+
+def encode_typed_data_compat(*, domain_data, message_types, message_data):
+    if _encode_typed_data_new is not None:
+        return _encode_typed_data_new(
+            domain_data=domain_data,
+            message_types=message_types,
+            message_data=message_data,
+        )
+    if _encode_structured_data_old is not None:
+        return _encode_structured_data_old(
+            primitive={
+                'types': {
+                    'EIP712Domain': [
+                        {'name': 'name', 'type': 'string'},
+                        {'name': 'version', 'type': 'string'},
+                        {'name': 'chainId', 'type': 'uint256'},
+                        {'name': 'verifyingContract', 'type': 'address'},
+                    ],
+                    **message_types,
+                },
+                'primaryType': next(iter(message_types.keys())),
+                'domain': domain_data,
+                'message': message_data,
+            }
+        )
+    raise ImportError('No compatible eth_account typed-data encoder found')
 
 ORDER_TYPES = {
     "Order": [
@@ -62,7 +97,7 @@ class WalletSigner:
         }
 
     def _sign(self, domain: Dict[str, Any], types: Dict[str, Any], message: Dict[str, Any]) -> str:
-        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
+        signable = encode_typed_data_compat(domain_data=domain, message_types=types, message_data=message)
         return "0x" + self.account.sign_message(signable).signature.hex()
 
     def sign_order(self, order: Dict[str, Any], product_id: int) -> str:

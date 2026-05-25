@@ -6,6 +6,7 @@ from typing import Optional
 @dataclass
 class PositionState:
     in_position: bool = False
+    entry_pending: bool = False
     side: Optional[str] = None
     entry_price: Optional[Decimal] = None
     size: Decimal = Decimal('0')
